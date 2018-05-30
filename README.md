@@ -1,3 +1,178 @@
+# 3D Quad Estimator
+## Implement Estimator
+
+### 1. The standard deviation of the measurement noise of both GPS X data and Accelerometer X data.
+
+The calculated standard deviation correctly captured ~68% of the sensor measurements. 
+```
+PASS: ABS(Quad.GPS.X-Quad.Pos.X) was less than MeasuredStdDev_GPSPosXY for 68% of the time
+PASS: ABS(Quad.IMU.AX-0.000000) was less than MeasuredStdDev_AccelXY for 69% of the time
+```
+I determined the standard deviation given the simulated sensor measurements like this.
+```
+import numpy as np                                                                                                                    
+graph1 = np.genfromtxt('config/log/Graph1.txt', delimiter=',', dtype=None, encoding='utf8')
+graph2 = np.genfromtxt('config/log/Graph2.txt', delimiter=',', dtype=None, encoding='utf8')
+
+graph1_std = np.std(graph1[1:,1].astype('float32'), ddof=1)
+graph2_std = np.std(graph2[1:,1].astype('float32'), ddof=1)
+
+print(graph1[0,1].astype('str'), graph1_std, graph2[0,1].astype('str'), graph2_std)
+```
+
+### 2. A better rate gyro attitude integration scheme in the UpdateFromIMU() function.
+
+The improved integration scheme resulted in an attitude estimator of < 0.1 rad for each of the Euler angles for a duration of at least 3 seconds during the simulation.
+```
+PASS: ABS(Quad.Est.E.MaxEuler) was less than 0.100000 for at least 3.000000 seconds
+```
+The integration scheme use quaternions to improve performance over the current simple integration scheme.
+```
+Quaternion<float> attitude = Quaternion<float>::FromEuler123_RPY(rollEst, pitchEst, ekfState(6));
+attitude.IntegrateBodyRate(gyro, dtIMU);
+
+float predictedRoll = attitude.Roll();
+float predictedPitch = attitude.Pitch();
+ekfState(6) = attitude.Yaw();
+```
+
+### 3. The Prediction Step for the estimator.
+
+`QuadEstimatorEKF::Predict(float dt, V3F accel, V3F gyro)` does the prediction step. It first gets the mean state, predictedState from the transition model.
+![](images/transition.png)
+![](images/Rbg.png)
+```
+Quaternion<float> attitude = Quaternion<float>::FromEuler123_RPY(rollEst, pitchEst, curState(6));
+
+// The state vector is [x, y, z, x_dot, y_dot, z_dot, yaw] 
+// and the control is [x_dot_dot_b, y_dot_dot_b, z_dot_dot_b, yaw_dot]
+predictedState(0) += curState(3) * dt;
+predictedState(1) += curState(4) * dt;
+predictedState(2) += curState(5) * dt;
+
+const V3F acc_inertial = attitude.Rotate_BtoI(accel) - V3F(0.0F, 0.0F, static_cast<float>(CONST_GRAVITY));
+
+predictedState(3) += acc_inertial.x * dt;
+predictedState(4) += acc_inertial.y * dt;
+predictedState(5) += acc_inertial.z * dt;
+```
+Next, it gets the derivatives of the transition model. The acceleration was accounted for as a command in the calculation of gPrime. 
+
+![](images/g_prime.png)
+![](images/Rbg_prime.png)
+```
+float phi = roll ;
+float theta = pitch;
+float psi = yaw ;
+
+RbgPrime(0,0) = -cos(theta) * sin(psi);
+RbgPrime(0,1) = -sin(phi) * sin(theta) * sin(psi) - cos(phi) * cos(psi);
+RbgPrime(0,2) = -cos(phi) * sin(theta) * sin(psi) + sin(phi) * cos(psi);
+
+RbgPrime(1,0) = cos(theta) * cos(psi);
+RbgPrime(1,1) = sin(phi) * sin(theta) * cos(psi) - cos(phi) * sin(psi);
+RbgPrime(1,2) = cos(phi) * sin(theta) * cos(psi) + sin(phi) * sin(psi);
+
+RbgPrime(2,0) = 0;
+RbgPrime(2,1) = 0;
+RbgPrime(2,2) = 0;
+
+MatrixXf gPrime(QUAD_EKF_NUM_STATES, QUAD_EKF_NUM_STATES);
+gPrime.setIdentity();
+
+gPrime(0, 3) = dt;
+gPrime(1, 4) = dt;
+gPrime(2, 5) = dt;
+gPrime(3, 6) = (RbgPrime(0) * accel).sum() * dt;
+gPrime(4, 6) = (RbgPrime(1) * accel).sum() * dt;
+gPrime(5, 6) = (RbgPrime(2) * accel).sum() * dt;
+```
+Last, updates the state covariance.
+![](images/predict.png)
+```
+ekfCov = gPrime * ekfCov * gPrime.transpose() + Q;
+```
+### 4. The Magnetometer Update.
+
+The update includes the magnetometer data into the state. 
+```
+PASS: ABS(Quad.Est.E.Yaw) was less than 0.120000 for at least 10.000000 seconds
+PASS: ABS(Quad.Est.E.Yaw-0.000000) was less than Quad.Est.S.Yaw for 75% of the time
+```
+```
+// The measurement z for the Magnetometer is [yaw] and the measurement model is h(xt) = [xt.yaw].
+hPrime(6) = 1;
+
+zFromX(0) = ekfState(6);
+float diff = magYaw - ekfState(6);
+
+// It measures the angle error between the current state and the magnetometer value the short way around, not the long way.
+if (diff > F_PI) {
+    zFromX(0) += 2.f*F_PI;
+} else if (diff < -F_PI) {
+    zFromX(0) -= 2.f*F_PI;
+}
+
+Update(z, hPrime, R_Mag, zFromX);
+```
+Here `Update` does EKF update step as following.
+![](images/update.png)
+```
+// Execute an EKF update step
+// z: measurement
+// H: Jacobian of observation function evaluated at the current estimated state
+// R: observation error model covariance 
+// zFromX: measurement prediction based on current state
+void QuadEstimatorEKF::Update(VectorXf& z, MatrixXf& H, MatrixXf& R, VectorXf& zFromX)
+{
+  ...
+  MatrixXf toInvert(z.size(), z.size());
+  toInvert = H*ekfCov*H.transpose() + R;
+  MatrixXf K = ekfCov * H.transpose() * toInvert.inverse();
+
+  ekfState = ekfState + K*(z - zFromX);
+
+  MatrixXf eye(QUAD_EKF_NUM_STATES, QUAD_EKF_NUM_STATES);
+  eye.setIdentity();
+
+  ekfCov = (eye - K*H)*ekfCov;
+}
+```
+
+### 5. The GPS Update.
+
+The estimator incorporates the GPS information to update the current state estimate.
+```
+PASS: ABS(Quad.Est.E.Pos) was less than 1.000000 for at least 20.000000 seconds
+```
+```
+// The measurement z for the GPS is [x, y, z, x_dot, y_dot, z_dot] and the measurement model is h(xt) = [xt.x, xt.y xt.z, xt.x_dot, xt.y_dot, xt.z_dot].
+hPrime(0, 0) = 1;
+hPrime(1, 1) = 1;
+hPrime(2, 2) = 1;
+hPrime(3, 3) = 1;
+hPrime(4, 4) = 1;
+hPrime(5, 5) = 1;
+
+zFromX(0) = ekfState(0);
+zFromX(1) = ekfState(1);
+zFromX(2) = ekfState(2);
+zFromX(3) = ekfState(3);
+zFromX(4) = ekfState(4);
+zFromX(5) = ekfState(5);
+
+Update(z, hPrime, R_GPS, zFromX);
+```
+
+## Flight Evaluation
+
+The controller developed in the previous project was de-tuned to successfully meet the performance criteria of the final scenario (<1m error for entire box flight).
+
+
+
+
+
+---
 # Estimation Project #
 
 Welcome to the estimation project.  In this project, you will be developing the estimation portion of the controller used in the CPP simulator.  By the end of the project, your simulated quad will be flying with your estimator and your custom controller (from the previous project)!

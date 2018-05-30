@@ -1,3 +1,5 @@
+readings
+
 ## Simulator specific ignores
 
 config/LastScenario.txt
@@ -12,7 +14,7 @@ config/LastScenario.txt
 [Rr]eleases/
 x64/
 x86/
-bld/
+build/
 [Bb]in/
 [Oo]bj/
 [Ll]og/
